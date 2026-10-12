@@ -36,6 +36,7 @@ two largest tensors (11x total with a Q4_0 repack) at unchanged acceptance. Keep
 them only for reduced-vocab drafts or for running the draft on devices the
 target does not use.
 """
+import logging
 import os
 import shutil
 import struct
@@ -104,6 +105,9 @@ class Reader:
             return (et, [self._val(et) for _ in range(n)])
         fmt = _FIXED[t]
         return struct.unpack(fmt, self.f.read(struct.calcsize(fmt)))[0]
+
+
+logger = logging.getLogger("gguf_dspark_to_dflash")
 
 
 def enc_str(s):
@@ -240,12 +244,13 @@ def main():
                     o.write(chunk)
                     left -= len(chunk)
 
-    print(f"  {os.path.basename(src_path)}")
-    print(f"    -> {os.path.basename(out_path)}")
+    logger.info(f"  {os.path.basename(src_path)}")
+    logger.info(f"    -> {os.path.basename(out_path)}")
     note = f", dropped shared: {', '.join(dropped)}" if dropped else ""
-    print(f"    kv {len(src.kv)} -> {len(new_kv)}, tensors {len(new_tensors)}, "
-          f"data {data_bytes} bytes copied verbatim{note}")
+    logger.info(f"    kv {len(src.kv)} -> {len(new_kv)}, tensors {len(new_tensors)}, "
+                f"data {data_bytes} bytes copied verbatim{note}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

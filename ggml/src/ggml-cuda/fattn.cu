@@ -157,8 +157,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
+    // Keep type_KV: for the in-place quantized K/V kernels ggml_cuda_flash_attn_ext_get_alloc_size reserves no F16
+    // K/V scratch after dst, so falling back to the F16 instance here would convert the cache past the allocation.
     if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV>(ctx, dst);
         return;
     }
 

@@ -130,7 +130,9 @@ def transform_kv(src_kv, donor_kv):
 
     for k, t, v in src_kv:
         if k == "general.architecture":
-            out.append((k, STR, "dflash")); seen.add(k); continue
+            out.append((k, STR, "dflash"))
+            seen.add(k)
+            continue
         if k.startswith("dspark.dspark."):
             rest = k[len("dspark.dspark."):]
             if rest == "mask_token_id":
@@ -148,12 +150,14 @@ def transform_kv(src_kv, donor_kv):
         if nk.endswith(".target_layers") and t == ARR:
             et, items = v
             v = (et, [int(x) + 1 for x in items])
-        out.append((nk, t, v)); seen.add(nk)
+        out.append((nk, t, v))
+        seen.add(nk)
 
     # tokenizer comes from the donor; legacy drafters carry no vocab at all
     for k, t, v in donor_kv:
         if k.startswith("tokenizer.") and k not in seen:
-            out.append((k, t, v)); seen.add(k)
+            out.append((k, t, v))
+            seen.add(k)
 
     if mask_token_id is not None and "tokenizer.ggml.mask_token_id" not in seen:
         t, v = mask_token_id

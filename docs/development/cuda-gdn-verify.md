@@ -23,14 +23,21 @@ GGML_CUDA_GDN_L8=1 ./build/bin/test-backend-ops test -b CUDA0 -o GATED_DELTA_NET
 
 Keep performance claims specific to the measured shapes and device. The source leaderboard compares a full speculative runtime against a serial control; it does not isolate this kernel or compare against the current fork.
 
-### H200 screen (2026-10-17)
+### H200 validation (2026-10-18)
 
 A Release sm_90 build passed all 56 GATED_DELTA_NET backend cases with the option off and on. A direct original/candidate comparison passed 432 bytewise attention and snapshot checks with production `-use_fast_math`, three fresh seeds, token counts 8/9/15/16, 12/32/48 value heads, one/two sequences, snapshot counts 3/17/18, and activated/raw gates. A compile-only sm_75 check passed; no sm_75 execution is claimed.
 
-Nine staged Bonsai 2 variants (2B, 4B and 9B in PTQ1_0, PQ2_0 and Q2_0) passed bytewise full-logit comparisons over 16 corpus slices of 512 accepted tokens each. The screen alternated 8/15/16-token batches and rolled back partial 15-token batches. Nsight Systems confirmed `gated_delta_net_l8v_cuda` execution for every variant. These are staged-artifact checks, not validation of every current published release, MTP integration or a complete speculative serving loop.
+All 14 pinned public Bonsai 2 target artifacts passed bytewise full-logit comparisons and Nsight confirmation of `gated_delta_net_l8v_cuda` execution:
 
-A staged 27B Q2_0 variant also passed the same checks over four 512-token slices, with kernel execution confirmed. A 27B PTQ1_0 comparison was inconclusive because a harness adjustment gave the two runs different slice counts; it is excluded. Published MTP variants, 27B PQ2_0/F16 and DGX Spark remain untested.
+| Size | Formats |
+|---|---|
+| 2B | PTQ1_0, PQ2_0, Q2_0 |
+| 4B | PTQ1_0, PQ2_0, Q2_0, PQ2_0-MTP-Q8_0 |
+| 9B | PTQ1_0, PQ2_0, Q2_0, PQ2_0-MTP-Q8_0 |
+| 27B | PTQ1_0, PQ2_0, F16 |
 
-At 32 value heads, one sequence and 18 snapshot slots, median original/candidate kernel time was 1.219x for activated gates and 1.214x for raw gates. At 48 heads and two sequences it fell to 0.864x and 0.875x. These CUDA-event measurements cover the kernel alone; they are not generation-throughput gains. The multi-sequence regression and unmeasured DGX Spark behavior are reasons to keep the option off by default.
+Each artifact's SHA256 matched its pinned public repository revision. Each arm used 16 corpus slices of 512 accepted tokens, one untimed warmup slice, and 8/15/16-token verification batches with partial rollback. Each comparison covered 10,234,757,120 bytes of logits. MTP-bearing artifacts were exercised as targets; this does not validate the complete MTP/DFlash serving loop. DGX Spark remains untested.
 
-A short 9B PQ2 full-logit verification/rollback screen was noisy and did not establish a model-level speedup: four runs used ABBA ordering, with off times 9.601/12.019 seconds and on times 9.609/13.492 seconds. Only two samples per arm were collected. The option remains experimental.
+Five matched timing pairs per artifact gave median paired original/candidate time ratios from 0.9900x to 1.0220x. Several pairs had substantial variability. The timer includes decode, all-logit retrieval and writes to `/dev/null`; it excludes loading, state resets and rollback API calls. These verification-workload timings do not establish a broad generation-throughput gain.
+
+At the isolated kernel level, 32 value heads, one sequence and 18 snapshot slots gave median original/candidate time of 1.219x for activated gates and 1.214x for raw gates. At 48 heads and two sequences this fell to 0.864x and 0.875x. The multi-sequence regression, small/noisy model-level differences and unmeasured Spark behavior are reasons to keep the option off by default.

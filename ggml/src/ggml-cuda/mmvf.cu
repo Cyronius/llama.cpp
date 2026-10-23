@@ -804,6 +804,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
+                    // a single matrix of a few dozen rows (the qwen35 gated-delta-net alpha/beta projection weights in
+                    // F32) runs faster as a mat-vec than through the TF32 tensor-core path at 4 to 8 columns, and every
+                    // column then matches its 1-column result bit for bit (FP32 mat-vec, K split independent of the
+                    // column count). Batched products (the delta-net chunk math) keep the existing path.
+                    if (src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1) {
+                        return ne11 <= MMVF_MAX_BATCH_SIZE;
+                    }
                     return ne11 <= 3;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {

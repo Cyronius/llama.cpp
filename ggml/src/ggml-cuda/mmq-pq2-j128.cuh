@@ -830,7 +830,10 @@ static bool ggml_cuda_mmq_pq2_j128_supported(const mmq_args & args) {
         args.ncols_dst >= 1 && args.ncols_max == args.ncols_dst &&
         (uintptr_t) args.y % 16 == 0 &&
         args.nrows_x*args.stride_row_x*(int64_t) sizeof(block_pq2_0) < (int64_t(1) << 31) &&
-        (args.ncols_x/QK_PQ2_0 + 1)*args.ncols_y*(int64_t) sizeof(block_q8_1_mmq) < (int64_t(1) << 31);
+        (args.ncols_x/QK_PQ2_0 + 1)*args.ncols_y*(int64_t) sizeof(block_q8_1_mmq) < (int64_t(1) << 31) &&
+        // Same bound as the GGML_ASSERT in launch_mul_mat_q (ntiles_dst*blocks_per_ne00 < 2^30). It keeps the int
+        // stream-k index kbc = b*ntiles*nkb/grid in range; shapes outside it take the existing path, which asserts.
+        ((args.nrows_x + 127)/128)*((args.ncols_max + 127)/128)*(args.ncols_x/QK_PQ2_0) < (int64_t(1) << 30);
 }
 
 // GGML_CUDA_PQ2_J128: 0 = off, any other integer = on (any NVIDIA sm_90+ device). Unset: on for Hopper (cc 9.x), where

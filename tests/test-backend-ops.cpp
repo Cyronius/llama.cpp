@@ -10591,6 +10591,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cpy_snapshots(3, 37, n_tok, K));
     }
 
+    // thin F32 src0 (GDN ssm_alpha/ssm_beta: 32 rows) at speculative verify widths
+    for (int64_t m : {32, 512, 513}) {
+        for (int n : {1, 3, 4, 5, 8, 9, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
     // PQ2_0 at the Bonsai 2 9B projection / vocab-head shapes and 3-8 columns (multi-column mat-vec)
     for (int64_t m : {4096, 12288, 248320}) {
         for (int64_t k : {4096, 12288}) {
@@ -11251,6 +11258,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         for (int kv : {1024, 8192, 32768}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    // thin F32 src0 (GDN ssm_alpha/ssm_beta) at verify widths
+    for (int64_t m : {32, 128, 512}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 4096, {1, 1}, {1, 1}));
         }
     }
 

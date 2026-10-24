@@ -4313,6 +4313,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Residual ADD -> RMS_NORM -> MUL(weight) -> MUL(Hadamard signs) -> RESHAPE -> MUL_MAT(Hadamard hint):
+    // the input of every Bonsai 2 FFN. One launch instead of three (add, norm, signed transform), bit-identical
+    // to them. The residual sum and the rotated activation are the only outputs; the normalized row is not
+    // needed anywhere else (ggml_can_fuse_subgraph checks). GGML_CUDA_NORM_FWHT_FUSION=0 disables it; it also
+    // stands aside when GGML_CUDA_FWHT_FUSION_PQ2 is set, so that opt-in still quantizes in the transform.
+    if (node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes) {
+        static const bool arf_disabled = (getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
+                                          atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0) ||
+                                         (getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
+                                          atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0);
+        ggml_tensor * rms_norm = cgraph->nodes[i + 1];
+        ggml_tensor * mul_w    = cgraph->nodes[i + 2];
+        ggml_tensor * mul_s    = cgraph->nodes[i + 3];
+        ggml_tensor * reshape  = cgraph->nodes[i + 4];
+        ggml_tensor * mm       = cgraph->nodes[i + 5];
+        const ggml_op ops[]       = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int     out_nodes[] = { i, i + 5 };
+        if (!arf_disabled && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+                rms_norm->op == GGML_OP_RMS_NORM && mul_w->op == GGML_OP_MUL && mul_s->op == GGML_OP_MUL &&
+                reshape->op == GGML_OP_RESHAPE && mm->op == GGML_OP_MUL_MAT &&
+                rms_norm->src[0] == node && (mul_w->src[0] == rms_norm || mul_w->src[1] == rms_norm) &&
+                mul_s->src[0] == mul_w && reshape->src[0] == mul_s && mm->src[1] == reshape &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            const ggml_tensor * a      = node->src[0];
+            const ggml_tensor * b      = node->src[1];
+            const ggml_tensor * weight = mul_w->src[0] == rms_norm ? mul_w->src[1] : mul_w->src[0];
+            const ggml_tensor * signs  = mul_s->src[1];
+            const int64_t ncols = node->ne[0];
+            if (a && b && weight && signs &&
+                    a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                    rms_norm->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 && mul_s->type == GGML_TYPE_F32 &&
+                    weight->type == GGML_TYPE_F32 && signs->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(a, b) && ggml_are_same_shape(a, node) && ggml_are_same_shape(node, rms_norm) &&
+                    ggml_are_same_shape(rms_norm, mul_w) && ggml_are_same_shape(mul_w, mul_s) &&
+                    ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(node) &&
+                    ggml_is_contiguous(weight) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+                    weight->ne[0] == ncols && ggml_nrows(weight) == 1 &&
+                    signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
+                    mm->src[0]->ne[0] == ncols && mm->ne[0] == ncols && ggml_nelements(mm) == ggml_nelements(node) &&
+                    ggml_cuda_add_rms_norm_fwht_supported((int) ncols) &&
+                    weight->data != node->data && signs->data != node->data &&
+                    weight->data != mm->data && signs->data != mm->data &&
+                    ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 2, false, true)) {
+                ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, mm);
+                return 5;
+            }
+        }
+    }
+
     // Preserve the residual sum for later graph consumers while normalizing it
     // in the same launch. This removes a full read of the residual tensor.
     //

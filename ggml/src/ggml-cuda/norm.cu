@@ -616,15 +616,16 @@ void ggml_cuda_op_add_rms_norm_fused(
     }
 }
 
-// Residual ADD + RMS_NORM + MUL(weight) + Hadamard sign flip + FWHT, one row per block (the FFN input of
+// [Residual ADD +] RMS_NORM + MUL(weight) + Hadamard sign flip + FWHT, one row per block (the FFN input of
 // every Bonsai 2 layer, and any other norm whose only consumer is a rotated matmul). Same arithmetic in the
-// same order as add_rms_norm_f32<1024> followed by fwht_cuda_block with signs, so the result is bit-identical:
+// same order as add_rms_norm_f32<1024> (or rms_norm_f32<1024> with the multiply) followed by fwht_cuda_block with
+// signs, so the result is bit-identical. The normalized row is also stored when other nodes read it:
 // thread tid holds elements tid + i*1024 for both the norm loop and the butterfly, and the butterfly stages
 // run in ascending stride order whatever the block width (ggml_cuda_fwht_block_butterfly).
-template <int N>
+template <int N, bool has_add>
 static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
         const float * a, const float * b, const float * weight, const float * signs,
-        float * sum, float * dst, const float eps, const float fwht_scale) {
+        float * sum, float * normed, float * dst, const float eps, const float fwht_scale) {
     constexpr int NT = 1024;
     constexpr int NE = N / NT;
     static_assert(N % NT == 0, "transform width must be a multiple of the block");
@@ -636,17 +637,27 @@ static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
     const int tid  = threadIdx.x;
     const int lane = tid % ggml_cuda_get_physical_warp_size();
     a   += row*N;
-    b   += row*N;
-    sum += row*N;
     dst += row*N;
+    if constexpr (has_add) {
+        b   += row*N;
+        sum += row*N;
+    }
+    if (normed) {
+        normed += row*N;
+    }
 
     float x[NE];
     float tmp = 0.0f;
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         const int col = i*NT + tid;
-        const float xi = __fadd_rn(a[col], b[col]);
-        sum[col] = xi;
+        float xi;
+        if constexpr (has_add) {
+            xi = __fadd_rn(a[col], b[col]);
+            sum[col] = xi;
+        } else {
+            xi = a[col];
+        }
         x[i] = xi;
         tmp += xi*xi;
     }
@@ -659,6 +670,9 @@ static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
     for (int i = 0; i < NE; ++i) {
         const int col = i*NT + tid;
         reg[i]  = scale*x[i]*weight[col];
+        if (normed) {
+            normed[col] = reg[i];
+        }
         reg[i]  = reg[i]*fwht_scale;
         reg[i] *= signs[col];
     }
@@ -677,12 +691,14 @@ bool ggml_cuda_add_rms_norm_fwht_supported(const int ncols) {
 
 void ggml_cuda_op_add_rms_norm_fwht_fused(
         ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * rms_norm,
-        const ggml_tensor * weight, const ggml_tensor * signs, ggml_tensor * dst) {
-    const ggml_tensor * a = add->src[0];
-    const ggml_tensor * b = add->src[1];
-    const int ncols = (int) add->ne[0];
+        const ggml_tensor * weight, const ggml_tensor * signs, ggml_tensor * normed, ggml_tensor * dst) {
+    // without an ADD the norm reads its own source
+    const ggml_tensor * x = add ? add : rms_norm->src[0];
+    const ggml_tensor * a = add ? add->src[0] : x;
+    const ggml_tensor * b = add ? add->src[1] : nullptr;
+    const int ncols = (int) x->ne[0];
     GGML_ASSERT(ggml_cuda_add_rms_norm_fwht_supported(ncols));
-    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(add));
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(x));
 
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
@@ -690,12 +706,21 @@ void ggml_cuda_op_add_rms_norm_fwht_fused(
 
     // fwht_dispatch: scale = 1 / sqrtf(n)
     const float fwht_scale = 1 / sqrtf(ncols);
-    const int64_t nrows = ggml_nrows(add);
+    const int64_t nrows = ggml_nrows(x);
     cudaStream_t stream = ctx.stream();
+    float * normed_d = normed ? (float *) normed->data : nullptr;
 #define ARF_CASE(NN) \
-    case NN: add_rms_norm_fwht_f32<NN><<<(unsigned) nrows, 1024, 0, stream>>>( \
-        (const float *) a->data, (const float *) b->data, (const float *) weight->data, (const float *) signs->data, \
-        (float *) add->data, (float *) dst->data, eps, fwht_scale); break;
+    case NN: \
+        if (add) { \
+            add_rms_norm_fwht_f32<NN, true><<<(unsigned) nrows, 1024, 0, stream>>>( \
+                (const float *) a->data, (const float *) b->data, (const float *) weight->data, (const float *) signs->data, \
+                (float *) add->data, normed_d, (float *) dst->data, eps, fwht_scale); \
+        } else { \
+            add_rms_norm_fwht_f32<NN, false><<<(unsigned) nrows, 1024, 0, stream>>>( \
+                (const float *) a->data, nullptr, (const float *) weight->data, (const float *) signs->data, \
+                nullptr, normed_d, (float *) dst->data, eps, fwht_scale); \
+        } \
+        break;
     switch (ncols) {
         ARF_CASE(1024)
         ARF_CASE(2048)

@@ -1442,7 +1442,10 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* reasoning_effort_allow    */ params_base.reasoning_effort_allow,
+                /* reasoning_effort_fallback */ params_base.reasoning_effort_fallback,
+                /* reasoning_max_tok_floor   */ params_base.reasoning_max_tokens_floor
             };
 
             {
@@ -1931,18 +1934,9 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
-            const size_t max_probs = cur.size();
-            const size_t n_probs = std::min(max_probs, n_probs_request);
-
-            // set probability for sampled token
-            for (size_t i = 0; i < max_probs; i++) {
-                // set probability for sampled token
-                if (cur[i].id == result.tok) {
-                    result.prob = cur[i].p;
-                    break;
-                }
-            }
+            // also sets the probability for the sampled token
+            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request, result.tok, &result.prob);
+            const size_t n_probs = std::min(cur.size(), n_probs_request);
 
             // set probability for top n_probs tokens
             result.probs.reserve(n_probs);
@@ -2247,6 +2241,14 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
+        std::vector<uint8_t> spare_tgt;
+        std::vector<uint8_t> spare_dft;
+        const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
+            spare_tgt = std::move(ckpt.data_tgt);
+            spare_dft = std::move(ckpt.data_dft);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
@@ -2255,6 +2257,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                keep_spare(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2265,17 +2268,21 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            keep_spare(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+
+        cur.data_tgt = std::move(spare_tgt);
+        cur.data_dft = std::move(spare_dft);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range

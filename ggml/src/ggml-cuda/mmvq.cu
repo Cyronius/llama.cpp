@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-ptq1_0.cuh"
+#include "mmvq-pq2_0.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -302,6 +303,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
         // mat-vec 155 t/s vs MMQ 244 t/s at n=8).
+        // On Hopper it is the other way round: H200, Bonsai 2 27B, one forward of n tokens at depth 4096,
+        // MMQ 17.99 / 18.76 ms vs PT mat-vec 12.64 / 15.71 ms at n = 5 / 8. The PT kernel's per-column
+        // arithmetic does not depend on the column count, so 5-8 column results equal the 2-4 column ones.
+        if (cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) {
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
         return ne11 <= 4;
     }
 #endif
@@ -574,7 +581,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 
 // y_soa: PTQ1_0 one-column activations are in the warp-transposed exact-isum layout (see
 // ggml_cuda_q8_1_layout_for). Only ever instantiated true for type == PTQ1_0 && ncols_dst == 1.
-template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false>
+// rows of the weight matrix per CTA for a tall one-column mat-vec (see should_use_tall below)
+#define MMVQ_TALL_ROWS_PER_BLOCK 8
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false, bool tall = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -593,7 +603,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = tall ? MMVQ_TALL_ROWS_PER_BLOCK : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1112,9 +1122,10 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const bool tall = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    const int rpb = tall ? MMVQ_TALL_ROWS_PER_BLOCK : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1123,22 +1134,22 @@ static std::pair<dim3, dim3> calc_launch_params(
 
 // Resolves the runtime SoA decision to the y_soa template parameter. The true instantiation exists
 // only for PTQ1_0 at one column, so every other type/column count compiles exactly one kernel body.
-template<ggml_type type, int c_ncols_dst, bool has_fusion, bool has_gate, bool small_k, bool halve_iters, typename... Args>
+template<ggml_type type, int c_ncols_dst, bool has_fusion, bool has_gate, bool small_k, bool halve_iters, bool tall, typename... Args>
 static void mul_mat_vec_q_launch(const bool y_soa, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
     if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1) {
         if (y_soa) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, true>,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, true, tall>,
                                     launch_params, std::forward<Args>(args)...);
             return;
         }
     } else {
         GGML_ASSERT(!y_soa);
     }
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, false>,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, false, tall>,
                             launch_params, std::forward<Args>(args)...);
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool tall = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1154,12 +1165,12 @@ static void mul_mat_vec_q_switch_fusion(
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             if (fusion.gate != nullptr) {
-                mul_mat_vec_q_launch<type, c_ncols_dst, true, true, small_k, halve_iters>(y_soa, launch_params,
+                mul_mat_vec_q_launch<type, c_ncols_dst, true, true, small_k, halve_iters, tall>(y_soa, launch_params,
                      vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                      sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
             } else {
-                mul_mat_vec_q_launch<type, c_ncols_dst, true, false, small_k, halve_iters>(y_soa, launch_params,
+                mul_mat_vec_q_launch<type, c_ncols_dst, true, false, small_k, halve_iters, tall>(y_soa, launch_params,
                      vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                      channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                      sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1171,7 +1182,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    mul_mat_vec_q_launch<type, c_ncols_dst, false, false, small_k, halve_iters>(y_soa, launch_params,
+    mul_mat_vec_q_launch<type, c_ncols_dst, false, false, small_k, halve_iters, tall>(y_soa, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1217,6 +1228,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool y_soa = y_layout == GGML_CUDA_Q8_1_SOA_ISUM;
 
 #if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_PQ2_0) {
+        if (y_layout == GGML_CUDA_Q8_1_PQ2) {
+            // layout_host only picks PQ2 for plain 2D calls without fusion
+            GGML_ASSERT(!ids && nchannels_dst == 1 && nsamples_dst == 1 && !fusion.gate && !fusion.x_bias && !fusion.gate_bias);
+            mul_mat_vec_pq2_0_mc_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst, stream);
+            return;
+        }
+    }
     if constexpr (type == GGML_TYPE_PTQ1_0) {
         // plain 2D PTQ1_0 mat-vec with 2-8 columns: dedicated kernel with full lane utilization,
         // see mmvq-ptq1_0.cuh. One column takes the SoA path in the generic kernel below.
@@ -1313,6 +1332,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
+    // One-column PQ2_0 on Hopper: the default geometry gives each row its own 128-thread CTA, and at K = 4096 every
+    // thread then decodes a single 32-element chunk, so a tall matrix becomes hundreds of thousands of tiny CTAs
+    // (Bonsai 2 9B LM head, 248320 x 4096: 249 us, about 1.1 TB/s on an H200). Eight rows per CTA keep the same K
+    // partition and reduction order for every row (each row's sum is bit-identical) and cut that to 121 us; the
+    // 4096-12288 row trunk projections gain 28-42% as well. Matrices under 4096 rows have too few CTAs for it.
+    const auto should_use_tall = [&] {
+        return type == GGML_TYPE_PQ2_0 && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+               cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL && !has_ids && !y_soa && nrows_x >= 4096 &&
+               nrows_x % MMVQ_TALL_ROWS_PER_BLOCK == 0; // whole CTAs: rows past the end would be read, not only skipped
+    };
+
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
@@ -1329,8 +1359,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto tall_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
+                constexpr bool c_tall    = decltype(tall_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
@@ -1339,8 +1370,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                      nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
+                                                                      nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, c_tall);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_tall>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride, y_soa,
@@ -1348,11 +1379,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                launch(std::true_type{},  std::false_type{}, std::false_type{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::false_type{}, std::true_type{},  std::false_type{});
+            } else if constexpr (type == GGML_TYPE_PQ2_0) {
+                if (should_use_tall()) {
+                    launch(std::false_type{}, std::false_type{}, std::true_type{});
+                } else {
+                    launch(std::false_type{}, std::false_type{}, std::false_type{});
+                }
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch(std::false_type{}, std::false_type{}, std::false_type{});
             }
         } break;
         case 2: {
@@ -1665,7 +1702,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     // Same (type, ncols_dst, ids) triple the kernel switch evaluates, so quantizer and kernel agree.
-    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) (ids ? ne2 : ne11), ids != nullptr);
+    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) (ids ? ne2 : ne11), ids != nullptr, ne12 == 1 && ne13 == 1);
 
     int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     if (y_layout == GGML_CUDA_Q8_1_SOA_ISUM) {

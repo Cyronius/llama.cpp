@@ -132,21 +132,38 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_hint(const char * p) {
 #endif
 }
 
+// The shared-window loads are PTX; HIP never dispatches this kernel (NVIDIA sm_90+ only)
+// but still compiles the header, so give it stubs instead of inline asm.
 static __device__ __forceinline__ float ggml_cuda_pq2_j128_lds_f32(const uint32_t addr) {
     float v;
+#if !defined(GGML_USE_HIP)
     asm volatile("ld.shared.f32 %0, [%1];" : "=f"(v) : "r"(addr));
+#else
+    GGML_UNUSED(addr);
+    v = 0.0f;
+#endif
     return v;
 }
 
 static __device__ __forceinline__ float2 ggml_cuda_pq2_j128_lds_v2f32(const uint32_t addr) {
     float2 v;
+#if !defined(GGML_USE_HIP)
     asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "r"(addr));
+#else
+    GGML_UNUSED(addr);
+    v = make_float2(0.0f, 0.0f);
+#endif
     return v;
 }
 
 static __device__ __forceinline__ uint4 ggml_cuda_pq2_j128_lds_v4(const uint32_t addr) {
     uint4 v;
+#if !defined(GGML_USE_HIP)
     asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+#else
+    GGML_UNUSED(addr);
+    v = make_uint4(0, 0, 0, 0);
+#endif
     return v;
 }
 
@@ -885,7 +902,10 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
     const int device = ggml_cuda_get_device();
     if (!attr_set[device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+#if !defined(GGML_USE_HIP)
+        // the carveout attribute has no HIP mapping in vendors/hip.h; this path is NVIDIA-only anyway
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
+#endif
         attr_set[device] = true;
     }
     kernel<<<dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream>>>(args.x, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
